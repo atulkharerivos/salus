@@ -139,13 +139,13 @@ impl CpuInfo {
         // 'interrupt-controller' sub-node indicates if AIA is supported. We rely on AIA support
         // in order to direct interrupts to VS level, so mandate its presence.
         let intc_node = intc_node_from_cpu_node(dt, cpu0);
-        intc_node
+        /*intc_node
             .props()
             .find(|p| {
                 p.name() == "compatible"
                     && p.value_str().unwrap_or("").contains("riscv,cpu-intc-aia")
             })
-            .expect("CPU does not support AIA");
+            .expect("CPU does not support AIA");*/
 
         let mut hart_ids = ArrayVec::new();
         hart_ids.push(hart_id_from_cpu_node(cpu0));
