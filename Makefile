@@ -36,19 +36,19 @@ BOOTARGS := console=hvc0 earlycon=sbi
 #  MEM_SIZE: RAM size for the emulated system. Default: 4GB
 #  EXTRA_QEMU_ARGS: Any extra flags to pass to QEMU (e.g. other devices).
 
-NCPU ?= 1
+NCPU ?= 2
 MEM_SIZE ?= 4096
 EXTRA_QEMU_ARGS ?=
 
 ifneq ($(VECTORS),)
 CPU_TYPE := rv64,v=on,vlen=256,elen=64
 else
-CPU_TYPE := rv64
+CPU_TYPE := rivos-sentinel,rcode=on,pmp=off,x-ssaia=on 
 endif
 
-CPU_ARGS := $(CPU_TYPE),x-aia=true,sscofpmf=true
+CPU_ARGS := $(CPU_TYPE)#,aia=true#,sscofpmf=true
 
-MACH_ARGS := -M virt,aia=aplic-imsic,aia-guests=4 -cpu $(CPU_ARGS)
+MACH_ARGS := -M rivos-ap -cpu $(CPU_ARGS)
 MACH_ARGS += -smp $(NCPU) -m $(MEM_SIZE) -nographic
 
 HOST_TRIPLET := $(shell cargo -Vv | grep '^host:' | awk ' { print $$2; } ')
@@ -69,6 +69,8 @@ check:
 		--doc
 
 CARGO_FLAGS :=
+
+WORK_DIR := /home/akhare/src
 
 .PHONY: salus
 salus:
@@ -105,9 +107,11 @@ run_tellus_gdb: tellus_bin salus_debug
 		$(EXTRA_QEMU_ARGS)
 
 run_tellus: tellus_bin salus
-	$(QEMU_BIN) \
+	$(QEMU_BIN) -S -s  \
 		$(MACH_ARGS) \
-		-kernel $(RELEASE_BINS)salus \
+		-global lua-engine.script=$(WORK_DIR)/lua-scripts/ap-init.lua \
+		-device loader,file=$(WORK_DIR)/r-code/rcode_test \
+	        -kernel $(RELEASE_BINS)salus \
 		-device guest-loader,kernel=tellus_guestvm,addr=$(KERNEL_ADDR) \
 		$(EXTRA_QEMU_ARGS)
 

@@ -54,6 +54,7 @@ use s_mode_utils::sbi_console::SbiConsole;
 use smp::PerCpu;
 use spin::Once;
 use vm::HostVm;
+use sbi::*;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -525,6 +526,12 @@ extern "C" fn kernel_init(hart_id: u64, fdt_addr: u64) {
         }
     }
 
+    let tsm_image = find_available_region(&mem_map, 1024*1024*2)
+        .expect("Not enough free memory for hypervisor heap");
+
+    mem_map.reserve_region(HwReservedMemType::PageMap, 
+        RawAddr::supervisor(tsm_image.bits()), 1024*1024*2)
+    .expect("Couldn't allocate memory");
     setup_hyp_paging(&mut mem_map);
 
     // Set up per-CPU memory and boot the secondary CPUs.
@@ -575,6 +582,15 @@ extern "C" fn kernel_init(hart_id: u64, fdt_addr: u64) {
             println!("Failed to probe IOMMU: {:?}", e);
         }
     };
+
+    let mtt_address = *SATP_VAL.get().unwrap() & 0xFFFFFFF;
+    
+    println!("Page addr: {:x}", tsm_image.bits());
+    println!("SATP: {:x}", mtt_address);
+
+    let msg = SbiMessage::Rcode(RivosSupport::BiosEnd { mtt_address, tsm_image: tsm_image.bits()});
+    let result = unsafe { ecall_send(&msg) };
+    println!("ECALL: {:?}", result);
 
     // Now load the host VM.
     let host = HostVmLoader::new(
