@@ -40,6 +40,8 @@ pub struct CpuInfo {
     has_sscofpmf: bool,
     // True if the vector extension is supported
     has_vector: bool,
+    // True if Sscdeleg extension is supported.
+    has_sscdeleg: bool,
     // CPU timer frequency.
     timer_frequency: u32,
     // ISA string as reported in the device-tree. All CPUs are expected to have the same ISA.
@@ -155,6 +157,7 @@ impl CpuInfo {
             has_sstc: isa_string_has_extension(isa_string, "sstc"),
             has_sscofpmf: isa_string_has_extension(isa_string, "sscofpmf"),
             has_vector: isa_string_has_base_extension(isa_string, 'v'),
+            has_sscdeleg: isa_string_has_extension(isa_string, "sscdeleg"),
             isa_string: ArrayString::from(isa_string).unwrap(),
             timer_frequency,
             hart_ids,
@@ -187,6 +190,11 @@ impl CpuInfo {
     /// Returns true if the vector extension is supported
     pub fn has_vector(&self) -> bool {
         self.has_vector
+    }
+
+    /// Returns true if Sscdeleg extension is supported
+    pub fn has_sscdeleg(&self) -> bool {
+        self.has_sscdeleg
     }
 
     /// Returns the total number of CPUs.
