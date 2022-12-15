@@ -2864,6 +2864,13 @@ pub const CSR_MHPMCOUNTER28H: u16 = 0xb9c;
 pub const CSR_MHPMCOUNTER29H: u16 = 0xb9d;
 pub const CSR_MHPMCOUNTER30H: u16 = 0xb9e;
 pub const CSR_MHPMCOUNTER31H: u16 = 0xb9f;
+// 0xd00 and 0x900 - 0x905 are placeholders pending finalization.
+pub const CSR_SMCOUNTEREN: u16 = 0xd00;
+pub const CSR_SCOUNTERSELECT: u16 = 0x901;
+pub const CSR_SHPMEVENT: u16 = 0x902;
+pub const CSR_SHPMCOUNTER: u16 = 0x903;
+pub const CSR_SCOUNTINHIBIT: u16 = 0x904;
+pub const CSR_SHPMEVENTH: u16 = 0x905;
 pub const CAUSE_MISALIGNED_FETCH: u8 = 0x0;
 pub const CAUSE_FETCH_ACCESS: u8 = 0x1;
 pub const CAUSE_ILLEGAL_INSTRUCTION: u8 = 0x2;

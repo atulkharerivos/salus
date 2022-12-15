@@ -75,6 +75,11 @@ pub struct CSR {
     pub vlenb: ReadWriteRiscvCsr<vlenb::Register, CSR_VLENB>,
 
     pub hpmcounter: [&'static dyn RiscvCsrInterface<R = hpmcounter::Register>; 32],
+    pub smcounteren: ReadWriteRiscvCsr<smcounteren::Register, CSR_SMCOUNTEREN>,
+    pub scounterselect: ReadWriteRiscvCsr<scounterselect::Register, CSR_SCOUNTERSELECT>,
+    pub shpmevent: ReadWriteRiscvCsr<shpmevent::Register, CSR_SHPMEVENT>,
+    pub shpmcounter: ReadWriteRiscvCsr<shpmcounter::Register, CSR_SHPMCOUNTER>,
+    pub scountinhibit: ReadWriteRiscvCsr<scountinhibit::Register, CSR_SCOUNTINHIBIT>,
 }
 
 // Define the "addresses" of each CSR register.
@@ -167,4 +172,9 @@ pub const CSR: &CSR = &CSR {
         &ReadWriteRiscvCsr::<hpmcounter::Register, 0xc1e>::new(),
         &ReadWriteRiscvCsr::<hpmcounter::Register, 0xc1f>::new(),
     ],
+    smcounteren: ReadWriteRiscvCsr::new(),
+    scounterselect: ReadWriteRiscvCsr::new(),
+    shpmevent: ReadWriteRiscvCsr::new(),
+    shpmcounter: ReadWriteRiscvCsr::new(),
+    scountinhibit: ReadWriteRiscvCsr::new(),
 };
