@@ -125,6 +125,62 @@ pub enum SbiMessage {
     Attestation(AttestationFunction),
     /// The extension for getting performance counter state.
     Pmu(PmuFunction),
+    Rcode(RivosSupport),
+}
+
+#[derive(Copy, Clone, Debug)]
+/// TSM load
+pub enum RivosSupport {
+    ConvertToConfidential {
+        /// Base address of 2MB region to be converted into confidential memory
+        nc_region_base_address: u64,
+        /// Physical address of entry point (set to -1 to skip)
+        entry_point: u64,
+    },
+}
+
+impl RivosSupport {
+    /// Attempts to parse `Self` from the passed in `a0-a7`.
+    pub(crate) fn from_regs(args: &[u64]) -> Result<Self> {
+        match args[6] {
+            0 => Ok(RivosSupport::ConvertToConfidential {
+                nc_region_base_address: args[0],
+                entry_point: args[1],
+            }),
+            _ => Err(Error::NotSupported),
+        }
+    }
+}
+
+impl SbiFunction for RivosSupport {
+    fn a6(&self) -> u64 {
+        5
+    }
+
+    fn a1(&self) -> u64 {
+        match self {
+            RivosSupport::ConvertToConfidential {
+                nc_region_base_address: _,
+                entry_point,
+            } => *entry_point,
+        }
+    }
+
+    fn a0(&self) -> u64 {
+        match self {
+            RivosSupport::ConvertToConfidential {
+                nc_region_base_address,
+                entry_point: _,
+            } => *nc_region_base_address,
+        }
+    }
+
+    fn result(&self, a0: u64, a1: u64) -> Result<u64> {
+        match a0 {
+            0 => Ok(a1),
+            e => Err(Error::from_code(e as i64)),
+        }
+    }
 }
 
 impl SbiMessage {
@@ -145,6 +201,7 @@ impl SbiMessage {
             EXT_TEE_GUEST => TeeGuestFunction::from_regs(args).map(SbiMessage::TeeGuest),
             EXT_ATTESTATION => AttestationFunction::from_regs(args).map(SbiMessage::Attestation),
             EXT_PMU => PmuFunction::from_regs(args).map(SbiMessage::Pmu),
+            EXT_RIVOS_SUPPORT => RivosSupport::from_regs(args).map(SbiMessage::Rcode),
             _ => Err(Error::NotSupported),
         }
     }
@@ -163,6 +220,7 @@ impl SbiMessage {
             TeeGuest(_) => EXT_TEE_GUEST,
             Attestation(_) => EXT_ATTESTATION,
             Pmu(_) => EXT_PMU,
+            Rcode(_) => EXT_RIVOS_SUPPORT,
         }
     }
 
@@ -182,6 +240,7 @@ impl SbiMessage {
             TeeGuest(f) => f.a6(),
             Attestation(f) => f.a6(),
             Pmu(f) => f.a6(),
+            Rcode(f) => f.a6(),
         }
     }
 
@@ -199,6 +258,7 @@ impl SbiMessage {
             TeeGuest(f) => f.a5(),
             Attestation(f) => f.a5(),
             Pmu(f) => f.a5(),
+            Rcode(_) => 0,
         }
     }
 
@@ -216,6 +276,7 @@ impl SbiMessage {
             TeeGuest(f) => f.a4(),
             Attestation(f) => f.a4(),
             Pmu(f) => f.a4(),
+            Rcode(_) => 0,
         }
     }
 
@@ -233,6 +294,7 @@ impl SbiMessage {
             TeeGuest(f) => f.a3(),
             Attestation(f) => f.a3(),
             Pmu(f) => f.a3(),
+            Rcode(_) => 0,
         }
     }
 
@@ -250,6 +312,7 @@ impl SbiMessage {
             TeeGuest(f) => f.a2(),
             Attestation(f) => f.a2(),
             Pmu(f) => f.a2(),
+            Rcode(_) => 0,
         }
     }
 
@@ -267,6 +330,7 @@ impl SbiMessage {
             TeeGuest(f) => f.a1(),
             Attestation(f) => f.a1(),
             Pmu(f) => f.a1(),
+            Rcode(f) => f.a1(),
         }
     }
 
@@ -284,6 +348,7 @@ impl SbiMessage {
             TeeGuest(f) => f.a0(),
             Attestation(f) => f.a0(),
             Pmu(f) => f.a0(),
+            Rcode(f) => f.a0(),
         }
     }
 

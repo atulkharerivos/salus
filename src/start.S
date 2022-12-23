@@ -24,7 +24,6 @@ _start:
     sd   zero, (a3)
     addi a3, a3, 8
     blt  a3, a4, 1b
-
     la   sp, _stack_end
     call kernel_init
     j    wfi_loop
@@ -46,3 +45,41 @@ _secondary_start:
 wfi_loop:
     wfi
     j    wfi_loop
+
+.global _convert_memory
+_convert_memory:
+
+    li a7, 0x0900074f
+    li a6, 5
+    li a0, 0x80400000
+    li a1, -1
+    ecall
+    li a0, 0xc0200000
+    li a1, -1
+    ecall
+    li a0, 0x80200000
+    la a1, resume_here
+    ecall
+resume_here:
+    ret
+
+
+.global _test_sret
+_test_sret:
+    la    t1, _enter_here
+    csrw  sepc, t1
+
+    li    t1, 0
+    csrrw t1, sstatus, t1
+    mv    t2, t1
+
+    la    t1, _trap_here
+    csrrw t1, stvec, t1
+    sret
+
+_trap_here:
+    csrrw t2, sstatus, t2
+    ret
+
+_enter_here:
+    ecall

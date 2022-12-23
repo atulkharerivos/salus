@@ -728,6 +728,7 @@ impl<'a, T: GuestStagePagingMode> FinalizedVm<'a, T> {
                 self.handle_attestation_msg(attestation_func, active_vcpu.active_pages())
             }
             SbiMessage::Pmu(pmu_func) => self.handle_pmu_msg(pmu_func, active_vcpu).into(),
+            sbi::SbiMessage::Rcode(_) => unreachable!(),
         }
     }
 

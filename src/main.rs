@@ -217,7 +217,7 @@ fn setup_hyp_paging(hyp_map: HypMap, hyp_mem: &mut HypPageAlloc) {
 
 /// Creates a heap from the given `mem_map`, marking the region occupied by the heap as reserved.
 fn create_heap(mem_map: &mut HwMemMap) {
-    const HEAP_SIZE: u64 = 16 * 1024 * 1024;
+    const HEAP_SIZE: u64 = 64 * 1024 * 1024;
 
     let heap_base = find_available_region(mem_map, HEAP_SIZE)
         .expect("Not enough free memory for hypervisor heap");
@@ -315,6 +315,11 @@ fn check_vector_width() {
     CSR.sstatus.read_and_clear_bits(sstatus::vs::Dirty.value);
 }
 
+extern "C" {
+    fn _convert_memory();
+    fn _test_sret();
+}
+
 /// The entry point of the Rust part of the kernel.
 #[no_mangle]
 extern "C" fn kernel_init(hart_id: u64, fdt_addr: u64) {
@@ -322,8 +327,10 @@ extern "C" fn kernel_init(hart_id: u64, fdt_addr: u64) {
     setup_csrs();
 
     SbiConsoleV01::set_as_console();
-    println!("Salus: Boot test VM");
-
+    unsafe { 
+        _convert_memory();
+        _test_sret(); 
+    }
     // Safe because we trust that the firmware passed a valid FDT.
     let hyp_fdt =
         unsafe { Fdt::new_from_raw_pointer(fdt_addr as *const u8) }.expect("Failed to read FDT");
@@ -428,6 +435,22 @@ extern "C" fn kernel_init(hart_id: u64, fdt_addr: u64) {
     // Set up per-CPU memory and boot the secondary CPUs.
     PerCpu::init(hart_id, &mut mem_map);
 
+    let tsm_image = find_available_region(&mem_map, 1024 * 1024 * 16)
+        .expect("Not enough free memory for hypervisor heap");
+
+    fn round_up(val: u64) -> u64 {
+        (val +  0x800000 - 1) & !(0x800000 - 1)
+    }
+        
+    mem_map
+        .reserve_region(
+            HwReservedMemType::PageMap,
+            RawAddr::supervisor(tsm_image.bits()),
+            1024 * 1024 * 16,
+        )
+        .expect("Couldn't allocate memory");
+    println!("{:x} {:x}", tsm_image.bits(), round_up(tsm_image.bits()));
+
     // Create an allocator for the remaining pages. Anything that's left over will be mapped
     // into the host VM.
     let mut hyp_mem = HypPageAlloc::new(&mut mem_map);
@@ -524,8 +547,8 @@ extern "C" fn kernel_init(hart_id: u64, fdt_addr: u64) {
     // Lock down the boot time allocator before allowing the host VM to be entered.
     HYPERVISOR_ALLOCATOR.get().unwrap().seal();
 
-    smp::start_secondary_cpus();
-
+    //smp::start_secondary_cpus();
+    //unsafe { _convert_memory() };
     HOST_VM.call_once(|| host);
     let cpu_id = PerCpu::this_cpu().cpu_id();
     HOST_VM.get().unwrap().run(cpu_id.raw() as u64);
