@@ -2,13 +2,16 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
 
-use drivers::pmu;
-use riscv_regs::{RiscvCsrInterface, CSR, CSR_CYCLE};
+use drivers::{pmu, CpuInfo};
+use riscv_regs::{
+    defs::shpmevent, LocalRegisterCopy, RiscvCsrInterface, Writeable, CSR, CSR_CYCLE,
+};
 use s_mode_utils::print::*;
 use sbi::{
     Error as SbiError, PmuCounterConfigFlags, PmuCounterStartFlags, PmuCounterStopFlags,
     PmuEventType, Result as SbiResult,
 };
+use PmuCounterState::*;
 
 #[derive(Default, Copy, Clone)]
 struct CounterMaskIter {
@@ -318,11 +321,19 @@ impl VmPmuState {
     }
 
     fn configure_counter(&mut self, counter_index: u64, c: &CounterState) -> SbiResult<u64> {
-        let config_flags = c
-            .config_flags
-            .unset_auto_start()
-            .unset_skip_match()
-            .unset_clear_value();
+        let config_flags = if !CpuInfo::get().has_sscdeleg() {
+            c.config_flags
+                .unset_auto_start()
+                .unset_skip_match()
+                .unset_clear_value()
+        } else {
+            // Set skip_match if counter delegation is enabled
+            c.config_flags
+                .unset_auto_start()
+                .set_skip_match()
+                .unset_clear_value()
+        };
+
         self.configure_matching_counters_internal(
             counter_index,
             0x1,
@@ -365,6 +376,85 @@ impl VmPmuState {
         }
     }
 
+    fn configure_delegated_matching_counters(
+        &mut self,
+        counter_index: u64,
+        counter_mask: u64,
+        config_flags: PmuCounterConfigFlags,
+        event_type: PmuEventType,
+        event_data: u64,
+    ) -> SbiResult<u64> {
+        use sbi::PmuHardware::*;
+        fn configure_counter_csrs(
+            config_flags: PmuCounterConfigFlags,
+            event_type: PmuEventType,
+            event_data: u64,
+            counter_index: u64,
+        ) {
+            let mut shpmevent = LocalRegisterCopy::<u64, shpmevent::Register>::new(0);
+            // Translate uinh/sinh
+            if config_flags.is_uinh() {
+                shpmevent.modify(shpmevent::vuinh.val(1));
+            }
+            if config_flags.is_sinh() {
+                shpmevent.modify(shpmevent::vsinh.val(1));
+            }
+            shpmevent.modify(shpmevent::sinh.val(1));
+            // TODO: The mapping of events to platform counters is still under discussion.
+            // This will need to be revisited after the standard has been finalized.
+            match event_type {
+                PmuEventType::Hardware(_) | PmuEventType::Cache(_) => {
+                    shpmevent.modify(shpmevent::event_selector.val(event_type.raw()))
+                }
+                PmuEventType::RawEvent => {
+                    shpmevent.modify(shpmevent::event_selector.val(event_data))
+                }
+                _ => unreachable!(),
+            }
+            CSR.scounterselect.set(counter_index);
+            if !config_flags.is_skip_match() {
+                CSR.shpmevent.set(shpmevent.get());
+            }
+            if config_flags.is_clear_value() {
+                CSR.shpmcounter.set(0);
+            }
+            if config_flags.is_auto_start() {
+                CSR.scountinhibit.read_and_clear_bits(1 << counter_index);
+            }
+        }
+
+        let pmu_info = pmu::PmuInfo::get()?;
+        let counter_mask = pmu_info.filter_counter_mask(counter_index, counter_mask)?;
+        let index = if !config_flags.is_skip_match() {
+            let fixed_index = match event_type {
+                PmuEventType::Hardware(CpuCycles) => Some(0),
+                PmuEventType::Hardware(Instructions) => Some(2),
+                PmuEventType::Firmware(_) => return Err(SbiError::InvalidParam),
+                _ => None,
+            };
+            let iter = CounterMaskIter::new(counter_index, counter_mask);
+            let found_index = iter
+                .filter(|i| {
+                    (fixed_index.is_none() && *i > 2)
+                        || (fixed_index == Some(*i as u64)
+                            && pmu_info.get_counter_info(*i as u64).is_ok())
+                })
+                .find(|i| matches!(self.counter_state[*i], PmuCounterState::NotConfigured))
+                .ok_or(SbiError::InvalidParam)?;
+            Ok(found_index as u64)
+        } else {
+            // If skip_match is set, the counter must already be configured
+            self.counter_state
+                .get(counter_index as usize)
+                .filter(|s| matches!(s, Started(_) | Configured(_)))
+                .ok_or(SbiError::InvalidParam)?;
+            Ok(counter_index)
+        }?;
+
+        configure_counter_csrs(config_flags, event_type, event_data, index);
+        Ok(index)
+    }
+
     fn configure_matching_counters_internal(
         &mut self,
         counter_index: u64,
@@ -381,17 +471,29 @@ impl VmPmuState {
         if config_flags.is_sinh() {
             config_flags = config_flags.set_vsinh();
         }
-        let platform_counter_index = sbi::api::pmu::configure_matching_counters(
-            counter_index,
-            counter_mask,
-            config_flags.set_sinh().set_minh(),
-            event_type,
-            event_data,
-        )?;
+        let platform_counter_index = if !CpuInfo::get().has_sscdeleg() {
+            sbi::api::pmu::configure_matching_counters(
+                counter_index,
+                counter_mask,
+                config_flags.set_sinh().set_minh(),
+                event_type,
+                event_data,
+            )
+        } else {
+            // Ensure that skip_match is propogated in the delegated counters case
+            self.configure_delegated_matching_counters(
+                counter_index,
+                counter_mask,
+                config_flags,
+                event_type,
+                event_data,
+            )
+        }?;
         Ok(platform_counter_index)
     }
 
-    /// Calls the SBI configure_matching_counters() and performs internal bookkeeping on counter state.
+    /// Calls either SBI configure_matching_counters(), or the internal implementation depending on
+    /// whether Sscdeleg is supported, and performs internal bookkeeping on counter state.
     pub fn configure_matching_counters(
         &mut self,
         counter_index: u64,
@@ -425,10 +527,41 @@ impl VmPmuState {
         start_flags: PmuCounterStartFlags,
         initial_value: u64,
     ) -> SbiResult<()> {
-        sbi::api::pmu::start_counters(counter_index, counter_mask, start_flags, initial_value)
+        if !CpuInfo::get().has_sscdeleg() {
+            sbi::api::pmu::start_counters(counter_index, counter_mask, start_flags, initial_value)
+        } else {
+            self.start_delegated_counters(counter_index, counter_mask, start_flags, initial_value)
+        }
     }
 
     /// Calls the SBI start_counters() and performs internal bookkeeping on counter state.
+    fn start_delegated_counters(
+        &self,
+        counter_index: u64,
+        counter_mask: u64,
+        start_flags: PmuCounterStartFlags,
+        initial_value: u64,
+    ) -> SbiResult<()> {
+        let bitmask_iter = CounterMaskIter::new(counter_index, counter_mask);
+        let mut uninhibit_mask = 0u64;
+        for index in bitmask_iter {
+            if matches!(self.counter_state[index], Configured(_)) {
+                let index = index as u64;
+                if start_flags.is_init_value() {
+                    CSR.scounterselect.set(index);
+                    CSR.shpmcounter.set(initial_value);
+                }
+                uninhibit_mask |= 1 << index;
+            }
+        }
+        if uninhibit_mask != 0 {
+            CSR.scountinhibit.read_and_clear_bits(uninhibit_mask);
+        }
+        Ok(())
+    }
+
+    /// Calls either SBI start_counters(), or the internal implementation depending on
+    /// whether Sscdeleg is supported, and performs internal bookkeeping on counter state.
     pub fn start_counters(
         &mut self,
         counter_index: u64,
@@ -447,16 +580,45 @@ impl VmPmuState {
         result
     }
 
-    fn stop_counters_internal(
+    fn stop_delegated_counters(
+        &self,
+        counter_index: u64,
+        counter_mask: u64,
+        stop_flags: PmuCounterStopFlags,
+    ) -> SbiResult<()> {
+        let bitmask_iter = CounterMaskIter::new(counter_index, counter_mask);
+        let mut inhibit_mask = 0u64;
+        for index in bitmask_iter {
+            if matches!(self.counter_state[index], Started(_)) {
+                let index = index as u64;
+                inhibit_mask |= 1 << index;
+                if stop_flags.is_reset_flag() {
+                    CSR.scounterselect.set(index);
+                    CSR.shpmevent.set(0);
+                }
+            }
+        }
+        if inhibit_mask != 0 {
+            CSR.scountinhibit.read_and_set_bits(inhibit_mask);
+        }
+        Ok(())
+    }
+
+    pub fn stop_counters_internal(
         &mut self,
         counter_index: u64,
         counter_mask: u64,
         stop_flags: PmuCounterStopFlags,
     ) -> SbiResult<()> {
-        sbi::api::pmu::stop_counters(counter_index, counter_mask, stop_flags)
+        if !CpuInfo::get().has_sscdeleg() {
+            sbi::api::pmu::stop_counters(counter_index, counter_mask, stop_flags)
+        } else {
+            self.stop_delegated_counters(counter_index, counter_mask, stop_flags)
+        }
     }
 
-    /// Calls the SBI stop_counters() and performs internal bookkeeping on counter state.
+    /// Calls either SBI stop_counters(), or the internal implementation depending on
+    /// whether Sscdeleg is supported, and performs internal bookkeeping on counter state.
     pub fn stop_counters(
         &mut self,
         counter_index: u64,
