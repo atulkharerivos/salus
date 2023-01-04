@@ -129,6 +129,7 @@ pub enum VmExitCause {
     FatalEcall(SbiMessage),
     ResumableEcall(SbiMessage),
     BlockingEcall(SbiMessage, TlbVersion),
+    ForwardedEcall(SbiMessage),
     PageFault(Exception, GuestPageAddr),
     MmioFault(MmioOperation, GuestPhysAddr),
     Wfi(DecodedInstruction),
@@ -193,11 +194,11 @@ impl From<SbiError> for EcallError {
 
 #[derive(Clone, Copy, Debug)]
 enum EcallAction {
-    LegacyOk,
     Unhandled,
     Continue(SbiReturn),
     Break(VmExitCause, SbiReturn),
     Retry(VmExitCause),
+    Forward(SbiMessage),
 }
 
 impl From<EcallResult<u64>> for EcallAction {
@@ -489,9 +490,6 @@ impl<'a, T: GuestStagePagingMode> FinalizedVm<'a, T> {
             match exit {
                 VmCpuTrap::Ecall(Some(sbi_msg)) => {
                     match self.handle_ecall(sbi_msg, &mut active_vcpu) {
-                        EcallAction::LegacyOk => {
-                            active_vcpu.set_ecall_result(Legacy(0));
-                        }
                         EcallAction::Unhandled => {
                             active_vcpu.set_ecall_result(Standard(SbiReturn::from(
                                 SbiError::NotSupported,
@@ -503,6 +501,9 @@ impl<'a, T: GuestStagePagingMode> FinalizedVm<'a, T> {
                         EcallAction::Break(reason, sbi_ret) => {
                             active_vcpu.set_ecall_result(Standard(sbi_ret));
                             break reason;
+                        }
+                        EcallAction::Forward(sbi_msg) => {
+                            break VmExitCause::ForwardedEcall(sbi_msg);
                         }
                         EcallAction::Retry(reason) => {
                             break reason;
@@ -705,18 +706,12 @@ impl<'a, T: GuestStagePagingMode> FinalizedVm<'a, T> {
     /// Handles ecalls from the guest.
     fn handle_ecall(&self, msg: SbiMessage, active_vcpu: &mut ActiveVmCpu<T>) -> EcallAction {
         match msg {
-            SbiMessage::PutChar(c) => {
-                // put char - legacy command
-                print!("{}", c as u8 as char);
-                EcallAction::LegacyOk
-            }
+            SbiMessage::PutChar(_) => EcallAction::Forward(msg),
             SbiMessage::Reset(ResetFunction::Reset { .. }) => {
                 EcallAction::Break(VmExitCause::FatalEcall(msg), SbiReturn::success(0))
             }
             SbiMessage::Base(base_func) => EcallAction::Continue(self.handle_base_msg(base_func)),
-            SbiMessage::DebugConsole(debug_con_func) => {
-                self.handle_debug_console(debug_con_func, active_vcpu.active_pages())
-            }
+            SbiMessage::DebugConsole(debug_con_func) => self.handle_debug_console(debug_con_func),
             SbiMessage::HartState(hsm_func) => self.handle_hart_state_msg(hsm_func),
             SbiMessage::Nacl(nacl_func) => self.handle_nacl_msg(nacl_func, active_vcpu),
             SbiMessage::TeeHost(host_func) => self.handle_tee_host_msg(host_func, active_vcpu),
@@ -755,22 +750,12 @@ impl<'a, T: GuestStagePagingMode> FinalizedVm<'a, T> {
             initial_value: u64,
             active_vcpu: &mut ActiveVmCpu<T>,
         ) -> EcallResult<u64> {
-            let counter_mask = active_vcpu
-                .pmu()
-                .get_startable_counter_range(counter_index, counter_mask)?;
-            let result = sbi::api::pmu::start_counters(
+            let result = active_vcpu.pmu().start_counters(
                 counter_index,
                 counter_mask,
                 start_flags,
                 initial_value,
             );
-            // Special case "already started" to handle counters that are autostarted following configuration.
-            // Examples of such counters include the legacy timer and insret.
-            if result.is_ok() || matches!(result, Err(SbiError::AlreadyStarted)) {
-                active_vcpu
-                    .pmu()
-                    .update_started_counters(counter_index, counter_mask);
-            }
             result.map(|_| 0).map_err(EcallError::from)
         }
 
@@ -780,18 +765,9 @@ impl<'a, T: GuestStagePagingMode> FinalizedVm<'a, T> {
             stop_flags: PmuCounterStopFlags,
             active_vcpu: &mut ActiveVmCpu<T>,
         ) -> EcallResult<u64> {
-            let counter_mask = active_vcpu
+            let result = active_vcpu
                 .pmu()
-                .get_stoppable_counter_range(counter_index, counter_mask)?;
-            let result = sbi::api::pmu::stop_counters(counter_index, counter_mask, stop_flags);
-            // Special case "already stopped" to handle counters that can be reset following a stop
-            if result.is_ok()
-                || (matches!(result, Err(SbiError::AlreadyStopped)) && stop_flags.is_reset_flag())
-            {
-                active_vcpu
-                    .pmu()
-                    .update_stopped_counters(counter_index, counter_mask, stop_flags);
-            }
+                .stop_counters(counter_index, counter_mask, stop_flags);
             result.map(|_| 0).map_err(EcallError::from)
         }
 
@@ -803,26 +779,14 @@ impl<'a, T: GuestStagePagingMode> FinalizedVm<'a, T> {
             event_data: u64,
             active_vcpu: &mut ActiveVmCpu<T>,
         ) -> EcallResult<u64> {
-            let config_flags = config_flags.set_sinh().set_minh();
-            let counter_mask = active_vcpu.pmu().get_configurable_counter_range(
-                counter_index,
-                counter_mask,
-                config_flags,
-            )?;
-            let platform_counter_index = sbi::api::pmu::configure_matching_counters(
+            let result = active_vcpu.pmu().configure_matching_counters(
                 counter_index,
                 counter_mask,
                 config_flags,
                 event_type,
                 event_data,
-            )?;
-            active_vcpu.pmu().update_configured_counter(
-                platform_counter_index,
-                config_flags,
-                event_type,
-                event_data,
-            )?;
-            Ok(platform_counter_index)
+            );
+            result.map_err(EcallError::from)
         }
 
         match pmu_func {
@@ -890,48 +854,10 @@ impl<'a, T: GuestStagePagingMode> FinalizedVm<'a, T> {
         SbiReturn::success(ret)
     }
 
-    // Handles the printing of characters from VM memory.
-    // Copies the characters to a bounce buffer, parses them as UTF-8, and sends them on to the
-    // console.
-    // On success or error, returns the number of bytes written.
-    fn debug_console_print(
-        &self,
-        mut len: u64,
-        addr: u64,
-        active_pages: &ActiveVmPages<T>,
-    ) -> core::result::Result<u64, u64> {
-        let mut chunk = [0u8; 256];
-        let mut curr_addr = addr;
-        while len > 0 {
-            let count = core::cmp::min(len as usize, chunk.len());
-            active_pages
-                .copy_from_guest(
-                    &mut chunk[0..count],
-                    RawAddr::guest(curr_addr, self.page_owner_id()),
-                )
-                .map_err(|_| curr_addr - addr)?;
-            let s = core::str::from_utf8(&chunk[0..count]).map_err(|_| curr_addr - addr)?;
-            print!("{s}");
-            curr_addr += count as u64;
-            len -= count as u64;
-        }
-        Ok(len)
-    }
-
-    fn handle_debug_console(
-        &self,
-        debug_con_func: DebugConsoleFunction,
-        active_pages: &ActiveVmPages<T>,
-    ) -> EcallAction {
+    fn handle_debug_console(&self, debug_con_func: DebugConsoleFunction) -> EcallAction {
         match debug_con_func {
-            DebugConsoleFunction::PutString { len, addr } => {
-                EcallAction::Continue(match self.debug_console_print(len, addr, active_pages) {
-                    Ok(n) => SbiReturn::success(n),
-                    Err(n) => SbiReturn {
-                        error_code: sbi::SBI_ERR_INVALID_ADDRESS,
-                        return_value: n,
-                    },
-                })
+            DebugConsoleFunction::PutString { .. } => {
+                EcallAction::Forward(SbiMessage::DebugConsole(debug_con_func))
             }
         }
     }

@@ -15,7 +15,7 @@ use riscv_regs::{
     CSR_HTINST, CSR_HTVAL, CSR_SCAUSE, CSR_STVAL,
 };
 use s_mode_utils::print::*;
-use sbi::{self, SbiMessage};
+use sbi::{self, DebugConsoleFunction, Error as SbiError, SbiMessage, SbiReturn, StateFunction};
 
 use crate::guest_tracking::{GuestVm, Guests, Result as GuestTrackingResult};
 use crate::smp;
@@ -421,11 +421,27 @@ impl HostVmRunner {
                                 println!("Host VM requested shutdown");
                                 return ControlFlow::Break(());
                             }
-                            Ok(HartState(sbi::StateFunction::HartStart { hart_id, .. })) => {
+                            Ok(HartState(StateFunction::HartStart { hart_id, .. })) => {
                                 smp::send_ipi(CpuId::new(hart_id as usize));
                             }
-                            Ok(HartState(sbi::StateFunction::HartStop)) => {
+                            Ok(HartState(StateFunction::HartStop)) => {
                                 return ControlFlow::Continue(())
+                            }
+                            Ok(DebugConsole(DebugConsoleFunction::PutString { len, addr })) => {
+                                let sbi_ret = match self.handle_put_string(&vm, addr, len) {
+                                    Ok(n) => SbiReturn::success(n),
+                                    Err(n) => SbiReturn {
+                                        error_code: SbiError::InvalidAddress as i64,
+                                        return_value: n,
+                                    },
+                                };
+
+                                self.gprs.set_reg(GprIndex::A0, sbi_ret.error_code as u64);
+                                self.gprs.set_reg(GprIndex::A1, sbi_ret.return_value);
+                            }
+                            Ok(PutChar(c)) => {
+                                print!("{}", c as u8 as char);
+                                self.gprs.set_reg(GprIndex::A0, 0);
                             }
                             _ => {
                                 println!("Unhandled ECALL from host");
@@ -495,6 +511,48 @@ impl HostVmRunner {
         }
 
         Ok(())
+    }
+
+    fn handle_put_string<T: GuestStagePagingMode>(
+        &mut self,
+        vm: &FinalizedVm<T>,
+        addr: u64,
+        len: u64,
+    ) -> core::result::Result<u64, u64> {
+        // Pin the pages that we'll be printing from. We assume that the buffer is physically
+        // contiguous, which should be the case since that's how we set up the host VM's address
+        // space.
+        let page_addr = GuestPageAddr::with_round_down(
+            GuestPhysAddr::guest(addr, vm.page_owner_id()),
+            PageSize::Size4k,
+        );
+        let offset = addr - page_addr.bits();
+        let num_pages = PageSize::num_4k_pages(offset + len);
+        let pinned = vm
+            .vm_pages()
+            .pin_shared_pages(page_addr, num_pages)
+            .map_err(|_| 0u64)?;
+
+        // Print the bytes in chunks. We copy to a temporary buffer as the bytes could be modified
+        // concurrently by the VM on another CPU.
+        let mut copied = 0;
+        let mut hyp_addr = pinned.range().base().bits() + offset;
+        while copied != len {
+            let mut buf = [0u8; 256];
+            let to_copy = core::cmp::min(buf.len(), (len - copied) as usize);
+            for c in buf.iter_mut() {
+                // Safety: We've confirmed that the address is within a region of accessible memory
+                // and cannot be remapped as long as we hold the pin. `u8`s are always aligned and
+                // properly initialized.
+                *c = unsafe { core::ptr::read_volatile(hyp_addr as *const u8) };
+                hyp_addr += 1;
+            }
+            let s = core::str::from_utf8(&buf[..to_copy]).map_err(|_| copied)?;
+            print!("{s}");
+            copied += to_copy as u64;
+        }
+
+        Ok(len)
     }
 }
 

@@ -358,12 +358,22 @@ fn test_interrupts() {
 #[no_mangle]
 #[allow(clippy::zero_ptr)]
 extern "C" fn kernel_init(_hart_id: u64, boot_args: u64) {
-    SbiConsole::set_as_console();
+    base::probe_sbi_extension(sbi::EXT_TEE_GUEST).expect("TEE-Guest extension not present");
+
+    // Convert a page to shared memory for use with the debug console.
+    //
+    // Safety: We haven't touched this memory and we won't touch it until the call returns.
+    unsafe {
+        tee_guest::share_memory(GUEST_DBCN_ADDRESS, PAGE_SIZE_4K)
+            .expect("GuestVm -- ShareMemory failed");
+    }
+    let console_mem = unsafe {
+        core::slice::from_raw_parts_mut(GUEST_DBCN_ADDRESS as *mut u8, PAGE_SIZE_4K as usize)
+    };
+    SbiConsole::set_as_console(console_mem);
 
     println!("*****************************************");
     println!("Hello world from Tellus guest            ");
-
-    base::probe_sbi_extension(sbi::EXT_TEE_GUEST).expect("TEE-Guest extension not present");
 
     let vectors_enabled = boot_args & BOOT_ARG_VECTORS_ENABLED != 0;
     if vectors_enabled {

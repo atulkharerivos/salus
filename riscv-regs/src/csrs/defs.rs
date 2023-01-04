@@ -457,3 +457,42 @@ register_bitfields![u64,
         value OFFSET(0) NUMBITS(64) [],
     ]
 ];
+
+register_bitfields![u32,
+    pub smcounteren [
+        value OFFSET(0) NUMBITS(32) [],
+    ]
+];
+
+// CSR that specifies index of the CSR for shpmevent / shpmcounter
+// Note that the autoincrement bit (31) is still under discussion
+register_bitfields![u32,
+    pub scounterselect [
+        index OFFSET(0) NUMBITS(5) [],
+    ]
+];
+
+// Shadow CSR for mhpmeventn
+register_bitfields![u64,
+    pub shpmevent [
+        event_selector OFFSET(0) NUMBITS(58) [],
+        vuinh OFFSET(58) NUMBITS(1) [],
+        vsinh OFFSET(59) NUMBITS(1) [],
+        uinh OFFSET(60) NUMBITS(1) [],
+        sinh OFFSET(61) NUMBITS(1) [],
+    ]
+];
+
+// Shadow CSR for mhpmeventn
+register_bitfields![u64,
+    pub shpmcounter [
+        value OFFSET(0) NUMBITS(64) [],
+    ]
+];
+
+// Shadow CSR for mcountinhibit
+register_bitfields![u32,
+    pub scountinhibit [
+        value OFFSET(0) NUMBITS(32) [],
+    ]
+];
