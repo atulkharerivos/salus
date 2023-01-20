@@ -6,9 +6,12 @@
 //! The MTT is maintained by the TSM (Salus), and it used by hardware to distinguish between
 //! confidential and non-confidential memory ranges.
 #![no_std]
+#![feature(if_let_guard)]
 
 // For testing use the std crate.
 #[cfg(test)]
 #[macro_use]
 extern crate std;
 
+/// The MTT is maintained by the TSM, and it used by hardware to distinguish between confidential and non-confidential memory ranges.
+pub mod mtt_types;

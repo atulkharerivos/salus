@@ -367,6 +367,7 @@ name = "mtt"
 version = "0.1.0"
 dependencies = [
  "riscv_pages",
+ "spin",
 ]
 
 [[package]]

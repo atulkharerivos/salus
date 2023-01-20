@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 riscv_pages = { path = "../riscv-pages"}
+spin = { version = "*", default-features = false, features = ["once", "spin_mutex"] }
