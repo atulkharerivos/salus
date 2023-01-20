@@ -11,3 +11,5 @@ edition = "2021"
 
 [dependencies]
 riscv_pages = { path = "../riscv-pages"}
+page_tracking = {path = "../page-tracking"}
+spin = { version = "*", default-features = false, features = ["once", "spin_mutex"] }

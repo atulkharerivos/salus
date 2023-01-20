@@ -366,7 +366,9 @@ dependencies = [
 name = "mtt"
 version = "0.1.0"
 dependencies = [
+ "page_tracking",
  "riscv_pages",
+ "spin",
 ]
 
 [[package]]
