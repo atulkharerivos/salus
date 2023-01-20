@@ -363,6 +363,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mtt"
+version = "0.1.0"
+dependencies = [
+ "riscv_pages",
+]
+
+[[package]]
 name = "num-derive"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -572,6 +579,7 @@ dependencies = [
  "hkdf",
  "hyp_alloc",
  "memoffset",
+ "mtt",
  "page_tracking",
  "rice",
  "riscv_elf",
