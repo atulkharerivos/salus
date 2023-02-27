@@ -12,6 +12,7 @@
 #[cfg(test)]
 #[macro_use]
 extern crate std;
+#[cfg_attr(test, allow(unused, dead_code, unused_imports))]
 
 /// Types related to MTT functionality.
 pub mod mtt;

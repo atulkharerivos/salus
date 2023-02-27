@@ -67,6 +67,7 @@ pub enum MttMemoryType {
     NonConfidential,
 }
 
+#[cfg(not(test))]
 mod mtt_const {
     pub const L2_TYPE_SHIFT: u64 = 34;
     // Bits 63:36 must be zero
@@ -84,6 +85,46 @@ mod mtt_const {
     // Bits 35:34 for a 64-MB region mapped using a bit-mask in a 4K L1-page
     pub const L2_L1_TYPE: u64 = 2;
     // Bits 35:34 for a 64-MB region mapped using a 2MB sub-region bitmask
+    pub const L2_64M_TYPE: u64 = 3;
+    // L2 has 1MB entries
+    pub const MTT_L2_ENTRY_COUNT: usize = 1024 * 1024;
+    // L2 is 8MB long
+    pub const L2_BYTE_SIZE: usize = 1024 * 1024 * 8;
+    // A L1 page consists of 512 8-byte entries
+    pub const L1_ENTRY_COUNT: usize = 512;
+    // Bits 25:17 for the 9-bit index
+    pub const L1_INDEX_MASK: u64 = 0x03fe_0000;
+    pub const L1_INDEX_SHIFT: u64 = 17;
+    // Bits 16:12 for the 5-bit sub-index
+    pub const L1_SUBINDEX_MASK: u64 = 0x1_f000;
+    // 1-bit left shift for the 2-bits per entry for bits (16:12)
+    pub const L1_SUBINDEX_SHIFT: u64 = 11;
+    // 2-bits per entry
+    pub const L1_ENTRY_MASK: u64 = 0x3;
+}
+
+// This is to help facilitate testing. The issue is that when testing, we use the PFN
+// of the VA for the L1-page, and since it tends to be very large (unlike the actual PA),
+// it might sets bits 35:34 when converting to a L1 page (thereby converting the L2 entry
+// into a different type). We avoid the issue by shifting everything left by 4.
+#[cfg(test)]
+mod mtt_const {
+    pub const L2_TYPE_SHIFT: u64 = 38;
+    // Bits 63:40 must be zero
+    pub const L2_ZERO_MASK: u64 = 0xffff_ff00_0000_0000;
+    // Bits 39:38
+    pub const L2_TYPE_MASK: u64 = 0x00c0_0000_0000;
+    // Bits 37:0
+    pub const L2_INFO_MASK: u64 = 0x003f_ffff_ffff;
+    // Bits 39:38 for a 1G non-confidential region
+    // By convention, this is a total of 16 identical consecutive entries, each mapping 64MB
+    pub const L2_1G_NC_TYPE: u64 = 0;
+    // Bits 39:38 for a 1G confidential region
+    // By convention, this is a total of 16 identical consecutive entries, each mapping 64MB
+    pub const L2_1G_C_TYPE: u64 = 1;
+    // Bits 39:38 for a 64-MB region mapped using a bit-mask in a 4K L1-page
+    pub const L2_L1_TYPE: u64 = 2;
+    // Bits 39:38 for a 64-MB region mapped using a 2MB sub-region bitmask
     pub const L2_64M_TYPE: u64 = 3;
     // L2 has 1MB entries
     pub const MTT_L2_ENTRY_COUNT: usize = 1024 * 1024;
@@ -140,6 +181,7 @@ static PLATFORM_MTT_TABLES: Once<Mtt> = Once::new();
 /// Successful invocation requires a preceding call to Mtt::init().
 impl Mtt {
     // Performs sanity checks on the platform L2 table
+    #[cfg(not(test))]
     fn validate_mtt(&self) -> Result<()> {
         let l2_dir = self.inner.lock();
         let l2_base_addr = l2_dir.mtt_l2_base.as_ptr() as usize;
@@ -153,6 +195,16 @@ impl Mtt {
                 return Err(InvalidPlatformConfiguration);
             }
         }
+        Ok(())
+    }
+
+    // Test only NOP validation
+    #[cfg(test)]
+    fn validate_mtt(&self) -> Result<()> {
+        let l2_dir = self.inner.lock();
+        // Intended only to silence clippy warning about unused imports while testing
+        let l2_base_addr = l2_dir.mtt_l2_base.as_ptr() as u64;
+        SupervisorPageAddr::new(RawAddr::supervisor(l2_base_addr)).ok_or(InvalidAddress)?;
         Ok(())
     }
 
@@ -965,5 +1017,196 @@ impl<'a> Iterator for MttRange<'a> {
         self.addr = self.addr.checked_add_pages_with_size(1, page_size).unwrap();
         self.len -= page_size as usize;
         Some((addr, page_size, l2_entry))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MttL2Entry::*;
+    use super::*;
+
+    fn verify_1g_type(addr: SupervisorPageAddr, memory_type: MttMemoryType) {
+        // Unwrap OK: Test case is expected to succeed
+        let platform_mtt_info = Mtt::get().unwrap();
+        let mut l2_dir = platform_mtt_info.inner.lock();
+        let entry_type = l2_dir.entry_for_addr(addr).unwrap();
+        if memory_type == MttMemoryType::Confidential {
+            assert!(matches!(entry_type, Confidential1G(_)));
+        } else {
+            assert!(matches!(entry_type, NonConfidential1G(_)));
+        }
+    }
+
+    fn verify_2m_type(addr: SupervisorPageAddr, memory_type: MttMemoryType) {
+        // Unwrap OK: Test case is expected to succeed
+        let platform_mtt_info = Mtt::get().unwrap();
+        let mut l2_dir = platform_mtt_info.inner.lock();
+        let entry_type = l2_dir.entry_for_addr(addr).unwrap();
+        assert!(matches!(entry_type, Mixed2M(_)));
+        // Unwrap OK: Test case is expected to succeed
+        let addr_2m = Aligned2MAddr::new(addr).unwrap();
+        match entry_type {
+            Mixed2M(mixed_2m) => {
+                let is_conf = mixed_2m.is_conf(addr_2m);
+                if memory_type == MttMemoryType::Confidential {
+                    assert!(is_conf);
+                } else {
+                    assert!(!is_conf);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn verify_4k_type(addr: SupervisorPageAddr, memory_type: MttMemoryType) {
+        // Unwrap OK: Test case is expected to succeed
+        let platform_mtt_info = Mtt::get().unwrap();
+        let mut l2_dir = platform_mtt_info.inner.lock();
+        let entry_type = l2_dir.entry_for_addr(addr).unwrap();
+        assert!(matches!(entry_type, L1Entry(_)));
+        // Unwrap OK: Test case is expected to succeed
+        match entry_type {
+            L1Entry(l1_entry) => {
+                // Safety: Testing purposes only
+                let l1_slice = unsafe { MttL1Page::l1_slice_from_pfn(l1_entry.pfn()) };
+                let is_conf = l1_entry.is_conf(addr, l1_slice);
+                if memory_type == MttMemoryType::Confidential {
+                    assert!(is_conf);
+                } else {
+                    assert!(!is_conf);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn test_mtt_ranges() {
+        use riscv_pages::PageSize;
+        const L1_PAGE_POOL_COUNT: usize = 16;
+        static mut MTT_BASE: [u64; MTT_L2_ENTRY_COUNT * 2] = [0; MTT_L2_ENTRY_COUNT * 2];
+        let mut l1_index = 0 as usize;
+        #[repr(align(4096))]
+        struct L1PagePool {
+            buffer: [u8; 4096 * L1_PAGE_POOL_COUNT],
+        }
+        static mut L1_PAGE_POOL: L1PagePool = L1PagePool {
+            buffer: [0; 4096 * L1_PAGE_POOL_COUNT],
+        };
+
+        let mut l1_allocator = || {
+            if l1_index < L1_PAGE_POOL_COUNT {
+                let addr = unsafe { &L1_PAGE_POOL.buffer[l1_index * 4096] as *const u8 as u64 };
+                let l1_page = SupervisorPageAddr::new(RawAddr::supervisor(addr)).unwrap();
+                l1_index = 1;
+                Some(l1_page)
+            } else {
+                None
+            }
+        };
+
+        // Safety: Testing purposes only
+        unsafe {
+            let l2_base = MTT_BASE.as_ptr() as u64;
+            const L2_ALIGNMENT: u64 = 1024 * 1024 * 8;
+            let aligned_mtt_base = (l2_base + L2_ALIGNMENT - 1) & !(L2_ALIGNMENT - 1);
+            // Unwrap OK: Test case is expected to succeed
+            Mtt::init(aligned_mtt_base, L2_BYTE_SIZE).unwrap();
+        }
+
+        // Unwrap OK: Alignment is guaranteed by construction
+        let addr = PageAddr::new(SupervisorPhysAddr::supervisor(0)).unwrap();
+
+        let len_1g = PageSize::Size1G as usize;
+        let len_2m = PageSize::Size2M as usize;
+        let len_4k = PageSize::Size4k as usize;
+
+        // Safety: Testing purposes only
+        unsafe {
+            verify_1g_type(addr, MttMemoryType::NonConfidential);
+
+            // Unwrap OK: Test case is expected to succeed
+            Mtt::set_non_confidential(addr, len_2m, &mut l1_allocator).unwrap();
+            verify_1g_type(addr, MttMemoryType::NonConfidential);
+            // Unwrap OK: Test case is expected to succeed
+            Mtt::set_non_confidential(addr, len_4k, &mut l1_allocator).unwrap();
+            verify_1g_type(addr, MttMemoryType::NonConfidential);
+
+            Mtt::set_confidential(addr, len_1g, &mut l1_allocator).unwrap();
+            for i in 0..=15 {
+                let addr_incr = addr
+                    .checked_add_pages_with_size(i * 32, PageSize::Size2M)
+                    .unwrap();
+                verify_1g_type(addr_incr, MttMemoryType::Confidential);
+            }
+
+            // Unwrap OK: Test case is expected to succeed
+            Mtt::set_non_confidential(addr, len_1g, &mut l1_allocator).unwrap();
+            verify_1g_type(addr, MttMemoryType::NonConfidential);
+            for i in 0..=15 {
+                let addr_incr = addr
+                    .checked_add_pages_with_size(i * 32, PageSize::Size2M)
+                    .unwrap();
+                verify_1g_type(addr_incr, MttMemoryType::NonConfidential);
+            }
+
+            Mtt::set_confidential(addr, len_1g, &mut l1_allocator).unwrap();
+            Mtt::set_confidential(addr, len_2m, &mut l1_allocator).unwrap();
+            verify_1g_type(addr, MttMemoryType::Confidential);
+            Mtt::set_confidential(addr, len_4k, &mut l1_allocator).unwrap();
+            verify_1g_type(addr, MttMemoryType::Confidential);
+
+            // This will break the 1GB regions into 64MB ranges
+            // Unwrap OK: Test case is expected to succeed
+            Mtt::set_non_confidential(addr, len_1g, &mut l1_allocator).unwrap();
+            verify_1g_type(addr, MttMemoryType::NonConfidential);
+            Mtt::set_confidential(addr, len_2m, &mut l1_allocator).unwrap();
+            verify_2m_type(addr, MttMemoryType::Confidential);
+            let addr_incr = addr
+                .checked_add_pages_with_size(1, PageSize::Size2M)
+                .unwrap();
+            verify_2m_type(addr_incr, MttMemoryType::NonConfidential);
+            let addr_incr = addr
+                .checked_add_pages_with_size(64, PageSize::Size2M)
+                .unwrap();
+            verify_2m_type(addr_incr, MttMemoryType::NonConfidential);
+            Mtt::set_non_confidential(addr, len_2m, &mut l1_allocator).unwrap();
+            verify_2m_type(addr, MttMemoryType::NonConfidential);
+
+            let addr = addr
+                .checked_add_pages_with_size(1, PageSize::Size1G)
+                .unwrap();
+            verify_1g_type(addr, MttMemoryType::NonConfidential);
+            // Unwrap OK: Test case is expected to succeed
+            Mtt::set_non_confidential(addr, len_4k, &mut l1_allocator).unwrap();
+            verify_1g_type(addr, MttMemoryType::NonConfidential);
+            Mtt::set_confidential(addr, len_4k, &mut l1_allocator).unwrap();
+            verify_4k_type(addr, MttMemoryType::Confidential);
+            let addr_incr = addr.checked_add_pages(1).unwrap();
+            verify_4k_type(addr_incr, MttMemoryType::NonConfidential);
+
+            let addr = addr
+                .checked_add_pages_with_size(1, PageSize::Size1G)
+                .unwrap();
+            verify_1g_type(addr, MttMemoryType::NonConfidential);
+            Mtt::set_confidential(addr, len_2m, &mut l1_allocator).unwrap();
+            verify_2m_type(addr, MttMemoryType::Confidential);
+            Mtt::set_non_confidential(addr, len_4k * 4, &mut l1_allocator).unwrap();
+            verify_4k_type(addr, MttMemoryType::NonConfidential);
+            for i in 0..4 {
+                let addr_incr = addr.checked_add_pages(i).unwrap();
+                verify_4k_type(addr_incr, MttMemoryType::NonConfidential);
+            }
+
+            let addr_incr = addr.checked_add_pages(5).unwrap();
+            verify_4k_type(addr_incr, MttMemoryType::Confidential);
+            assert!(Mtt::is_non_confidential(addr, len_4k * 4 as usize).unwrap());
+            assert!(!Mtt::is_non_confidential(addr, len_4k * 5 as usize).unwrap());
+            assert!(Mtt::is_confidential(addr_incr, len_2m - (len_4k * 5) as usize).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_mtt() {
+        test_mtt_ranges();
     }
 }
