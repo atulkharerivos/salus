@@ -119,10 +119,10 @@ impl<'a> MttL1Page<'a> {
     // The caller must guarantee that the pfn points to a valid L1 page that isn't
     // aliased elsewhere, and points to confidential memory. The page must remain
     // allocated for the lifetime of the entry in the L2 table.
-    unsafe fn l1_slice_from_pfn(pfn: SupervisorPfn) -> &'a mut [u64] {
+    unsafe fn from_pfn(pfn: SupervisorPfn) -> Self {
         let l1_page_addr = (pfn.bits() << 12) as *mut MttL1Page;
-        let l1_page = &mut *core::ptr::slice_from_raw_parts_mut(l1_page_addr, 1);
-        &mut l1_page[0].base[0..]
+        let l1_page = &*core::ptr::slice_from_raw_parts_mut(l1_page_addr, 1);
+        l1_page[0]
     }
 }
 
@@ -294,21 +294,21 @@ impl MemoryType for NonConf {}
 // 01b: Confidential 1GB range
 // 10b: A 64-MB range further described by 16K entries in a 4K page (pointed to by Info[33:0])
 // 11b: A 64-MB range composed of 32x2MB sub-ranges, and further described by Info[31:0]
-enum MttL2Entry {
+enum MttL2Entry<'a> {
     // The entire 1GB range containing the address is non-confidential.
     // 1GB ranges are mapped using 64MB subranges, and by convention, the invariant is
     // that each of the 16 consecutive entries in the L2 table have the same type.
-    NonConfidential1G(Mtt1GEntry<NonConf>),
+    NonConfidential1G(Mtt1GEntry<'a, NonConf>),
     // The entire 1GB range containing the address is confidential.
     // 1GB ranges are mapped using 64MB subranges, and by convention, the invariant is
     // that each of the 16 consecutive entries in the L2 table have the same type.
-    Confidential1G(Mtt1GEntry<Conf>),
+    Confidential1G(Mtt1GEntry<'a, Conf>),
     // The 64-MB range has been partitioned into 2MB regions, and each sub-region can be
     // confidential or non-confidential
-    Mixed2M(Mtt64MEntry),
+    Mixed2M(Mtt64mEntry<'a>),
     // The 64-MB range has been partitioned into 16K regions of 4KB size.
     // Each sub-region can be confidential or non-confidential
-    L1Entry(MttL1Entry),
+    L1Entry(MttL1Entry<'a>),
 }
 
 struct MttL2Directory {
@@ -337,7 +337,7 @@ impl MttL2Directory {
                     Ok(MttMemoryType::NonConfidential)
                 }
             }
-            L1Entry(l1_entry) => {
+            L1Entry(l1_page) => {
                 if is_4k_page_conf(l1_entry, addr) {
                     Ok(MttMemoryType::Confidential)
                 } else {
@@ -354,7 +354,7 @@ impl MttL2Directory {
         ((addr & 0x3fff_fc00_0000) >> 26) as usize
     }
 
-    fn entry_for_addr(&self, phys_addr: SupervisorPageAddr) -> Result<MttL2Entry> {
+    fn entry_for_addr(&mut self, phys_addr: SupervisorPageAddr) -> Result<MttL2Entry> {
         use MttL2Entry::*;
         let mtt_index = Self::get_mtt_index(phys_addr);
         let value = self.mtt_l2_base[mtt_index];
@@ -366,16 +366,21 @@ impl MttL2Directory {
         match mtt_l2_type {
             // INFO must be 0 for 1GB entries
             L2_1G_NC_TYPE if (value & L2_INFO_MASK) == 0 => {
-                Ok(NonConfidential1G(Mtt1GEntry::new_nc(mtt_index)))
+                Ok(NonConfidential1G(Mtt1GEntry::new_nc(&mut self.mtt_l2_base[mtt_index..=mtt_index+5])))
             }
             L2_1G_C_TYPE if (value & L2_INFO_MASK) == 0 => {
-                Ok(Confidential1G(Mtt1GEntry::new_conf(mtt_index)))
+                Ok(Confidential1G(Mtt1GEntry::new_conf(&mut self.mtt_l2_base[mtt_index..=mtt_index+5])))
             }
             L2_L1_TYPE => {
                 let pfn = Pfn::supervisor(value & L2_INFO_MASK);
-                Ok(L1Entry(MttL1Entry::new(mtt_index, pfn)))
+                // Safety: We are deferencing an existing L1 page entry in the MTT L2 table.
+                // This entry was created by Salus, or was created by trusted platform-FW,
+                // and the pfn corresponding to the page is guaranteed not be aliased and
+                // will remain valid for the lifetime of the L2 entry.
+                let l1_page = unsafe { MttL1Page::from_pfn(pfn) };
+                Ok(L1Entry(l1_page))
             }
-            L2_64M_TYPE => Ok(Mixed2M(Mtt64MEntry::new(mtt_index, value))),
+            L2_64M_TYPE => Ok(Mixed2M(Mtt64mEntry::new(&mut self.mtt_l2_base[mtt_index..=mtt_index+1]))),
             _ => Err(InvalidL2Entry),
         }
     }
@@ -394,7 +399,7 @@ impl MttL2Directory {
                     .take(16)
                     .enumerate()
                     .for_each(|(index, entry)| {
-                        *entry = Mtt64MEntry::new_conf_64m(mtt_index + index).raw();
+                        *entry = Mtt64mEntry::new_conf_64m(mtt_index + index).raw();
                     });
             }
             NonConfidential1G(_) => {
@@ -403,7 +408,7 @@ impl MttL2Directory {
                     .take(16)
                     .enumerate()
                     .for_each(|(index, entry)| {
-                        *entry = Mtt64MEntry::new_nc_64m(mtt_index + index).raw();
+                        *entry = Mtt64mEntry::new_nc_64m(mtt_index + index).raw();
                     });
             }
             _ => return Err(Non1GBL2Entry),
@@ -471,7 +476,7 @@ impl MttL2Directory {
                     self.mtt_l2_base[conf_1g.index..]
                         .iter_mut()
                         .take(16)
-                        .for_each(|entry| *entry = Mtt1GEntry::raw_nc());
+                        .for_each(|entry| *entry = Mtt1GEntry::raw_nc_1g());
                     true
                 } else {
                     false
@@ -482,7 +487,7 @@ impl MttL2Directory {
                     self.mtt_l2_base[nc_1g.index..]
                         .iter_mut()
                         .take(16)
-                        .for_each(|entry| *entry = Mtt1GEntry::raw_conf());
+                        .for_each(|entry| *entry = Mtt1GEntry::raw_conf_1g());
                     true
                 } else {
                     false
@@ -650,6 +655,111 @@ impl MttL2Directory {
         }
         Ok(mtt_needs_update)
     }
+}
+
+struct Mtt1GEntry<'a, T>
+where
+    T: MemoryType,
+{
+    entries: &'a mut [u64],
+    conf_state: PhantomData<T>,
+}
+
+impl<'a, T> Mtt1GEntry<'a, T>
+where
+    T: MemoryType,
+{
+    fn split(self) {
+        let val = if self.is_conf() {
+            Mtt64mEntry::raw_conf_1g_64m()
+        } else {
+            Mtt64mEntry::raw_nc_1g_64m()
+        };
+        self.entries.iter_mut().for_each(|entry| *entry = val);
+    }
+
+    fn is_conf(&self) -> bool {
+        let val = self.entries[0];
+        (val >> L2_TYPE_SHIFT) == L2_1G_C_TYPE
+    }
+
+    fn toggle_conf_type(self) {
+        let val = if self.is_conf() {
+            Mtt1GEntry::raw_nc_1g()
+        } else {
+            Mtt1GEntry::raw_conf_1g()
+        };
+        self.entries.iter_mut().for_each(|entry| *entry = val);
+    }
+}
+
+impl<'a> Mtt1GEntry<'a, Conf> {
+    fn new_conf(entries: &'a mut [u64]) -> Self {
+        Self {
+            entries,
+            conf_state: PhantomData,
+        }
+    }
+
+    fn raw_conf_1g() -> u64 {
+        L2_1G_C_TYPE << L2_TYPE_SHIFT
+    }
+}
+
+impl<'a> Mtt1GEntry<'a, NonConf> {
+    fn new_nc(entries: &'a mut [u64]) -> Self {
+        Self {
+            entries,
+            conf_state: PhantomData,
+        }
+    }
+
+    fn raw_nc_1g() -> u64 {
+        L2_1G_NC_TYPE << L2_TYPE_SHIFT
+    }
+}
+
+struct Mtt64mEntry<'a> {
+    entry: &'a mut [u64],
+}
+
+impl<'a> Mtt64mEntry<'a> {
+    fn new(entry: &'a mut [u64]) -> Mtt64mEntry {
+        Self { entry }
+    }
+
+    fn raw_conf_1g_64m() -> u64 {
+        L2_64M_TYPE << L2_TYPE_SHIFT | 0xffff_ffff
+    }
+
+    fn raw_nc_1g_64m() -> u64 {
+        L2_64M_TYPE << L2_TYPE_SHIFT
+    }
+
+    fn raw(&self) -> u64 {
+        self.entry[0]
+    }
+
+    fn get_bit_index(addr: Aligned2MAddr) -> u64 {
+        let addr_bits = addr.0.bits();
+        let round_down_64m = addr_bits & !((1024 * 1024 * 64) - 1);
+        (addr_bits - round_down_64m) / PageSize::Size2M as u64
+    }
+
+    fn set_conf_2m(&mut self, addr: Aligned2MAddr) {
+        let bit_index = Self::get_bit_index(addr);
+        self.entry[0] |= 1 << bit_index;
+    }
+
+    fn set_nc_2m(&mut self, addr: Aligned2MAddr) {
+        let bit_index = Self::get_bit_index(addr);
+        self.entry[0] &= !(1 << bit_index);
+    }
+
+    fn is_conf(&self, addr: Aligned2MAddr) -> bool {
+        let bit_index = Self::get_bit_index(addr);
+        self.entry[0] & (1 << bit_index) != 0
+    }
 
     // Converts an existing MTT L2 entry representing a 64MB range into a MttL1Entry.
     // The new entry will span the same 64MB range, but it will be broken up into
@@ -659,17 +769,15 @@ impl MttL2Directory {
     // race condition with an hardware initiated walk of the MTT. This is because we
     // bare converting from MTT2BPages to MTTL1Dir, and the type of MTT L2 entry remains
     // unchanged until it's atomically updated below following the L1 page write.
-    fn convert_to_l1_entry(
-        &mut self,
-        l1_page_addr: SupervisorPageAddr,
-        mixed_64m_entry: Mtt64MEntry,
-    ) -> MttL1Entry {
+    fn split_to_l1_entry(
+        self,
+        l1_page_addr: SupervisorPageAddr)  {
         let pfn = Pfn::supervisor(l1_page_addr.pfn().bits());
         // Safety: l1_page_addr was explictly allocated to map the 64m region, and has been
         // verified to be in confidential memory. The allocator has made guarantees regarding
         // the aliasing and lifetime of the page.
-        let l1_slice = unsafe { MttL1Page::l1_slice_from_pfn(pfn) };
-        let value = self.mtt_l2_base[mixed_64m_entry.index];
+        let l1_slice = unsafe { MttL1Page::from_pfn(pfn) };
+        let value = self.entry[0];
         for i in 0usize..=31 {
             // Mark the 2MB sub-range as confidential if the bit in the 32-bit mask is set
             let write_value = if (value & (1 << i)) != 0 {
@@ -678,97 +786,11 @@ impl MttL2Directory {
             } else {
                 0
             };
-            l1_slice.iter_mut().skip(i * 16).take(16).for_each(|entry| {
+            l1_slice.base.iter_mut().skip(i * 16).take(16).for_each(|entry| {
                 *entry = write_value;
             });
         }
-        self.mtt_l2_base[mixed_64m_entry.index] = MttL1Entry::raw_l1_entry(pfn);
-        MttL1Entry::new(mixed_64m_entry.index, pfn)
-    }
-}
-
-struct Mtt1GEntry<T>
-where
-    T: MemoryType,
-{
-    index: usize,
-    conf_state: PhantomData<T>,
-}
-
-impl Mtt1GEntry<Conf> {
-    fn new_conf(index: usize) -> Self {
-        Self {
-            index,
-            conf_state: PhantomData,
-        }
-    }
-
-    fn raw_conf() -> u64 {
-        L2_1G_C_TYPE << L2_TYPE_SHIFT
-    }
-}
-
-impl Mtt1GEntry<NonConf> {
-    fn new_nc(index: usize) -> Self {
-        Self {
-            index,
-            conf_state: PhantomData,
-        }
-    }
-
-    fn raw_nc() -> u64 {
-        L2_1G_NC_TYPE << L2_TYPE_SHIFT
-    }
-}
-
-struct Mtt64MEntry {
-    bit_mask_2m: u32,
-    index: usize,
-}
-
-impl Mtt64MEntry {
-    fn new_conf_64m(index: usize) -> Mtt64MEntry {
-        Self {
-            bit_mask_2m: 0xffff_ffff,
-            index,
-        }
-    }
-
-    fn raw(&self) -> u64 {
-        L2_64M_TYPE << L2_TYPE_SHIFT | self.bit_mask_2m as u64
-    }
-
-    fn new(index: usize, value: u64) -> Mtt64MEntry {
-        let bit_mask_2m = (value & 0xffff_ffff) as u32;
-        Self { bit_mask_2m, index }
-    }
-
-    fn new_nc_64m(index: usize) -> Mtt64MEntry {
-        Self {
-            bit_mask_2m: 0,
-            index,
-        }
-    }
-
-    fn get_bit_index(addr: Aligned2MAddr) -> u64 {
-        let addr_bits = addr.0.bits();
-        let round_down_64m = addr_bits & !((1024 * 1024 * 64) - 1);
-        (addr_bits - round_down_64m) / PageSize::Size2M as u64
-    }
-
-    fn set_conf_2m(&self, addr: Aligned2MAddr, l2_base: &mut [u64]) {
-        let bit_index = Self::get_bit_index(addr);
-        l2_base[self.index] |= 1 << bit_index;
-    }
-
-    fn set_nc_2m(&self, addr: Aligned2MAddr, l2_base: &mut [u64]) {
-        let bit_index = Self::get_bit_index(addr);
-        l2_base[self.index] &= !(1 << bit_index);
-    }
-
-    fn is_conf(&self, addr: Aligned2MAddr) -> bool {
-        let bit_index = Self::get_bit_index(addr);
-        self.bit_mask_2m & (1 << bit_index) != 0
+        self.entry[0] = MttL1Entry::raw_l1_entry(pfn);
     }
 }
 
@@ -797,14 +819,13 @@ impl MttL1EntryType {
 }
 
 #[allow(dead_code)]
-struct MttL1Entry {
-    index: usize,
-    l1_pfn: SupervisorPfn,
+struct MttL1Entry<'a> {
+    l1_page: MttL1Page<'a>,
 }
 
-impl MttL1Entry {
-    fn new(index: usize, l1_pfn: SupervisorPfn) -> Self {
-        Self { index, l1_pfn }
+impl<'a> MttL1Entry<'a> {
+    fn new(l1_page: MttL1Page<'a>) -> Self {
+        Self { l1_page }
     }
 
     fn raw_l1_entry(pfn: SupervisorPfn) -> u64 {
@@ -824,17 +845,13 @@ impl MttL1Entry {
         (l1_index as usize, sub_index)
     }
 
-    fn is_conf(&self, addr: SupervisorPageAddr, l1_slice: &[u64]) -> bool {
+    fn is_conf(&self, addr: SupervisorPageAddr) -> bool {
         use MttL1EntryType::*;
         let (l1_index, sub_index) = Self::get_l1_index_and_subindex(addr);
-        let value = l1_slice[l1_index];
+        let value = self.l1_page.base[l1_index];
         let l1_entry = MttL1EntryType::from_raw((value >> sub_index) & L1_ENTRY_MASK)
             .unwrap_or(MttNonConfidential4K);
         matches!(l1_entry, MttConfidential4K)
-    }
-
-    fn pfn(&self) -> SupervisorPfn {
-        self.l1_pfn
     }
 }
 
@@ -918,7 +935,7 @@ impl<'a> MttRange<'a> {
 // a mechanism to free allocated L1 pages. Also, 1G fragments are returned only
 // if the mapping is of the same type.
 impl<'a> Iterator for MttRange<'a> {
-    type Item = (SupervisorPageAddr, PageSize, MttL2Entry);
+    type Item = (SupervisorPageAddr, PageSize, MttL2Entry<'a>);
     fn next(&mut self) -> Option<Self::Item> {
         use MttL2Entry::*;
         if self.len == 0 {
